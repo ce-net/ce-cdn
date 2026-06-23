@@ -1,0 +1,44 @@
+[package]
+name = "ce-cdn"
+version = "0.1.0"
+edition = "2024"
+description = "Content-delivery / edge-cache network on CE — cache-and-serve content by CID with edge replication, TTL eviction, range reads, and capability-gated private content. An application built ON CE primitives (blobs/ce-pin, ce-cap, mesh), not part of the node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-cdn"
+keywords = ["ce", "cdn", "edge-cache", "content-addressed", "p2p"]
+categories = ["command-line-utilities", "network-programming"]
+authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
+
+# ce-cdn is both a reusable library (the edge cache, CID/range math, replication policy, protocol
+# types) and the `ce-cdn` binary. The library is unit/property-tested; the binary is the CLI over it.
+[lib]
+name = "ce_cdn"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-cdn"
+path = "src/main.rs"
+
+[dependencies]
+# The CE SDK: blobs/objects (put_blob/get_blob/put_object/get_object), mesh request/reply,
+# discovery, atlas/history, payment channels, content-addressing (cid/Manifest).
+ce-rs = { path = "../ce-rs" }
+# The capability verifier primitive — the edge host authorizes a signed attenuating chain before
+# serving private content.
+ce-cap = { path = "../ce/crates/ce-cap" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+
+[dev-dependencies]
+# Identity is only needed by tests (to forge capability chains for authorization checks).
+ce-identity = { path = "../ce/crates/ce-identity" }
+proptest = "1"
