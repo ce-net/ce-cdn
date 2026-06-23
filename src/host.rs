@@ -62,6 +62,12 @@ impl PublicSet {
     pub fn is_public(&self, cid: &str) -> bool {
         self.cids.contains(cid)
     }
+
+    /// Iterate the CIDs currently marked public. Order is unspecified (backed by a `HashSet`); the
+    /// HTTP `/status` handler sorts before rendering so the snapshot is deterministic.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.cids.iter().map(String::as_str)
+    }
 }
 
 /// Decide whether to honor a request for `action` on `cid`.
@@ -369,13 +375,8 @@ async fn handle_inner(
             let req: proto::StatusReq = serde_json::from_slice(&payload)?;
             let cache = state.cache.lock().await;
             let held = cache.contains_fresh(&req.cid, now);
-            let bytes = if held {
-                // contains_fresh is side-effect free; we don't have the byte length without a get,
-                // so report from age/ttl presence. A real edge would track sizes; report 0 if unknown.
-                cache.ttl_remaining(&req.cid, now).map(|_| 0).unwrap_or(0)
-            } else {
-                0
-            };
+            // Report the real stored size for a held CID (side-effect free, no `get`); 0 if absent.
+            let bytes = if held { cache.byte_len(&req.cid).unwrap_or(0) } else { 0 };
             let ttl_remaining = cache
                 .ttl_remaining(&req.cid, now)
                 .map(|t| if t == u64::MAX { 0 } else { t })

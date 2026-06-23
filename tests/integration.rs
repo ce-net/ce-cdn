@@ -313,6 +313,116 @@ fn malformed_protocol_payloads_are_errors_not_panics() {
     assert_eq!(resp.stored_bytes, 0);
 }
 
+// ---------------------------------------------------------------------------
+// HTTP front-end: drive the real hyper server over a real socket from outside the crate, asserting
+// status codes, range (206/416), cache headers, the private-content gate, and /status sizes.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use ce_cdn::host::EdgeState;
+use ce_cdn::server::{Origin, Running, ServerState, http_get, spawn};
+
+/// An in-memory origin (CID -> bytes) so the HTTP stack runs without a live CE node.
+struct MapOrigin(HashMap<String, Vec<u8>>);
+
+impl Origin for MapOrigin {
+    async fn fetch(&self, cid: &str) -> anyhow::Result<Vec<u8>> {
+        self.0.get(cid).cloned().ok_or_else(|| anyhow::anyhow!("missing {cid}"))
+    }
+}
+
+async fn http_server(
+    objects: &[(&str, &[u8])],
+    public: &[&str],
+    edge_id: [u8; 32],
+) -> Running {
+    let edge = EdgeState::new(1 << 20, 3600);
+    {
+        let mut p = edge.public.lock().await;
+        for c in public {
+            p.allow_public(c);
+        }
+    }
+    let map: HashMap<String, Vec<u8>> =
+        objects.iter().map(|(c, b)| (c.to_string(), b.to_vec())).collect();
+    let state = Arc::new(ServerState::new(edge, MapOrigin(map), edge_id, vec![]));
+    spawn(state).await.unwrap()
+}
+
+#[tokio::test]
+async fn http_front_end_full_range_416_and_404() {
+    let body: Vec<u8> = (0..120u8).collect();
+    let srv = http_server(&[("obj", &body)], &["obj"], [3u8; 32]).await;
+
+    // Full 200 with immutable cache headers.
+    let full = http_get(srv.addr(), "/cdn/obj", &[]).await.unwrap();
+    assert_eq!(full.status, 200);
+    assert_eq!(full.body, body);
+    assert!(full.header("cache-control").unwrap().contains("immutable"));
+    assert_eq!(full.header("accept-ranges"), Some("bytes"));
+
+    // 206 range.
+    let part = http_get(srv.addr(), "/cdn/obj", &[("Range", "bytes=10-29")]).await.unwrap();
+    assert_eq!(part.status, 206);
+    assert_eq!(part.header("content-range"), Some("bytes 10-29/120"));
+    assert_eq!(part.body, (10..30u8).collect::<Vec<u8>>());
+
+    // 416 unsatisfiable.
+    let bad = http_get(srv.addr(), "/cdn/obj", &[("Range", "bytes=500-600")]).await.unwrap();
+    assert_eq!(bad.status, 416);
+    assert_eq!(bad.header("content-range"), Some("bytes */120"));
+
+    // 404 for a public-but-absent CID (origin has nothing).
+    let srv2 = http_server(&[], &["ghost"], [3u8; 32]).await;
+    let nf = http_get(srv2.addr(), "/cdn/ghost", &[]).await.unwrap();
+    assert_eq!(nf.status, 404);
+}
+
+#[tokio::test]
+async fn http_front_end_private_gate_and_status_sizes() {
+    use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+
+    let edge = ident("http-edge");
+    let consumer = ident("http-consumer");
+
+    // Private content (not public): 403 without a cap, 200 with a valid cdn:read chain.
+    let srv = http_server(&[("priv", b"classified")], &[], edge.node_id()).await;
+    let denied = http_get(srv.addr(), "/cdn/priv", &[]).await.unwrap();
+    assert_eq!(denied.status, 403);
+
+    let cap = SignedCapability::issue(
+        &edge,
+        consumer.node_id(),
+        vec![proto::ABILITY_READ.to_string()],
+        Resource::Any,
+        Caveats::default(),
+        1,
+        None,
+    );
+    let caps_hex = encode_chain(&[cap]);
+    let req_hex = hex::encode(consumer.node_id());
+    let ok = http_get(
+        srv.addr(),
+        "/cdn/priv",
+        &[("X-Ce-Capability", &caps_hex), ("X-Ce-Node-Id", &req_hex)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.body, b"classified");
+
+    // /status reports the real per-CID byte size once cached.
+    let srv2 = http_server(&[("sized", &[0u8; 77])], &["sized"], [3u8; 32]).await;
+    let _ = http_get(srv2.addr(), "/cdn/sized", &[]).await.unwrap();
+    let status = http_get(srv2.addr(), "/status", &[]).await.unwrap();
+    assert_eq!(status.status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&status.body).unwrap();
+    assert_eq!(v["bytes"], 77);
+    assert_eq!(v["objects"][0]["cid"], "sized");
+    assert_eq!(v["objects"][0]["bytes"], 77);
+}
+
 #[test]
 fn slice_span_rejects_truncated_chunk_bytes() {
     // Simulate an edge returning fewer bytes than the range demands -> graceful error.

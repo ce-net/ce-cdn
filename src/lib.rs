@@ -20,6 +20,8 @@
 //! - [`caps`]        — resolving the `ce-cap` chain a client presents to edges.
 //! - [`client`]      — put / get (+ range) / purge / replicate over `ce-rs`.
 //! - [`host`]        — the capability-gated edge serve loop (caches + serves, public or cap-gated).
+//! - [`server`]      — the HTTP front-end: a `hyper` server exposing `GET /cdn/<cid>` (+ `/status`,
+//!   `/health`) mapped onto the pure [`edge::serve`] handler.
 //!
 //! ## Trust & money (honoring CE rules)
 //! Authorization is the one CE primitive: an edge verifies a signed, attenuating `ce-cap` chain
@@ -37,6 +39,7 @@ pub mod edge;
 pub mod host;
 pub mod proto;
 pub mod replication;
+pub mod server;
 
 /// Load accepted capability root keys for an edge: 64-hex NodeIds, one per line, `#` comments
 /// allowed. Looked up at `$CE_CDN_ROOTS`, else `$CE_DATA_DIR/roots`, else

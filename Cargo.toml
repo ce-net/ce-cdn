@@ -27,7 +27,12 @@ ce-rs = { path = "../ce-rs" }
 # serving private content.
 ce-cap = { path = "../ce/crates/ce-cap" }
 
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+# HTTP front-end: a real hyper 1.x server exposing GET /cdn/<cid> mapped onto the pure edge handler.
+# hyper-util provides the tokio IO adapter; http-body-util the `Full` body. Same stack ce-node uses.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

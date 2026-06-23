@@ -213,6 +213,14 @@ impl EdgeCache {
         self.entries.get(cid).map(|e| now.saturating_sub(e.inserted_at))
     }
 
+    /// The number of bytes the cache currently holds for `cid` (`None` if absent). Side-effect free
+    /// (does not touch recency or the hit/miss counters) — it lets a `cdn/status` probe report the
+    /// real stored size instead of a placeholder. Returns the size regardless of TTL freshness;
+    /// pair with [`contains_fresh`](Self::contains_fresh) when freshness matters.
+    pub fn byte_len(&self, cid: &str) -> Option<u64> {
+        self.entries.get(cid).map(|e| e.bytes.len() as u64)
+    }
+
     // ----- internals -----
 
     /// Remove an entry by key, decrementing the byte total. Returns whether it existed.
@@ -368,6 +376,26 @@ mod tests {
         let s = c.stats();
         assert_eq!(s.hits, 0);
         assert_eq!(s.misses, 0); // contains_fresh is side-effect free
+    }
+
+    #[test]
+    fn byte_len_reports_real_stored_size_side_effect_free() {
+        let mut c = EdgeCache::new(100, 0);
+        assert_eq!(c.byte_len("a"), None);
+        c.insert("a", vec![0; 7], 0);
+        assert_eq!(c.byte_len("a"), Some(7));
+        // Reading the size must not move recency or touch the hit/miss counters.
+        let s = c.stats();
+        assert_eq!(s.hits, 0);
+        assert_eq!(s.misses, 0);
+        // Replacing the entry updates the reported size.
+        c.insert("a", vec![0; 3], 0);
+        assert_eq!(c.byte_len("a"), Some(3));
+        // byte_len ignores freshness (size is known even for an expired-but-unswept entry).
+        let mut c2 = EdgeCache::new(100, 5);
+        c2.insert("b", vec![0; 9], 0); // expires at 5
+        assert!(!c2.contains_fresh("b", 100));
+        assert_eq!(c2.byte_len("b"), Some(9));
     }
 
     #[test]

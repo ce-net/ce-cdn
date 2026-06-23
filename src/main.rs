@@ -106,6 +106,10 @@ enum Cmd {
         /// CIDs to serve publicly (no capability required). Repeatable.
         #[arg(long = "public")]
         public: Vec<String>,
+        /// Also run the HTTP front-end on this address (e.g. `127.0.0.1:8845`), exposing
+        /// `GET /cdn/<cid>` (+ `/status`, `/health`). Omit to run mesh-only.
+        #[arg(long)]
+        http: Option<std::net::SocketAddr>,
     },
 }
 
@@ -139,11 +143,49 @@ async fn main() -> Result<()> {
         Cmd::Status { cid, caps: caps_arg } => {
             cmd_status(ce, &catalog_path, &cid, caps_arg.as_deref()).await
         }
-        Cmd::Serve { max_mb, ttl, public } => {
+        Cmd::Serve { max_mb, ttl, public, http } => {
             let max_bytes = max_mb.saturating_mul(1024 * 1024);
-            ce_cdn::host::serve(&ce, load_roots(), max_bytes, ttl, public).await
+            cmd_serve(ce, max_bytes, ttl, public, http).await
         }
     }
+}
+
+/// Run a CDN edge. Always serves over the mesh; if `http` is set, *also* runs the HTTP front-end
+/// bound to that address. The two front-ends share one edge state (cache + public set), so a CID
+/// cached via the mesh is served over HTTP and vice versa.
+async fn cmd_serve(
+    ce: CeClient,
+    max_bytes: u64,
+    ttl: u64,
+    public: Vec<String>,
+    http: Option<std::net::SocketAddr>,
+) -> Result<()> {
+    let roots = load_roots();
+    let Some(addr) = http else {
+        // Mesh-only edge (unchanged behaviour).
+        return ce_cdn::host::serve(&ce, roots, max_bytes, ttl, public).await;
+    };
+
+    use std::sync::Arc;
+    use ce_cdn::host::EdgeState;
+    use ce_cdn::server::{CeOrigin, ServerState};
+
+    let edge_hex = ce.status().await?.node_id;
+    let edge_id: [u8; 32] = hex::decode(&edge_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .context("node returned a malformed node id")?;
+
+    let edge = EdgeState::new(max_bytes, ttl);
+    {
+        let mut p = edge.public.lock().await;
+        for cid in &public {
+            p.allow_public(cid);
+        }
+    }
+    let state = Arc::new(ServerState::new(edge, CeOrigin::new(ce), edge_id, roots));
+    println!("ce-cdn HTTP front-end on http://{addr}  (GET /cdn/<cid>, /status, /health)");
+    ce_cdn::server::run(addr, state).await
 }
 
 #[allow(clippy::too_many_arguments)]
