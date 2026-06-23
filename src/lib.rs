@@ -18,6 +18,8 @@
 //! - [`replication`] — pure edge-ranking (atlas capacity + on-chain history) + re-replication policy.
 //! - [`catalog`]     — the publisher-side index (`cid -> Content + edge replicas`), persisted as JSON.
 //! - [`caps`]        — resolving the `ce-cap` chain a client presents to edges.
+//! - [`pop`]         — proof-of-possession for the HTTP edge: a short signed challenge proving the
+//!   caller holds the requester key, so `X-Ce-Node-Id` is verified, not trusted.
 //! - [`client`]      — put / get (+ range) / purge / replicate over `ce-rs`.
 //! - [`host`]        — the capability-gated edge serve loop (caches + serves, public or cap-gated).
 //! - [`server`]      — the HTTP front-end: a `hyper` server exposing `GET /cdn/<cid>` (+ `/status`,
@@ -37,6 +39,7 @@ pub mod cidrange;
 pub mod client;
 pub mod edge;
 pub mod host;
+pub mod pop;
 pub mod proto;
 pub mod replication;
 pub mod server;

@@ -16,10 +16,19 @@
 //!
 //! ## Access / authorization
 //! Public CIDs (in the edge's [`PublicSet`]) are served to anyone. For any other CID the caller must
-//! present a `ce-cap` chain — hex-encoded — via the `X-Ce-Capability` header (or
-//! `Authorization: Capability <hex>`). The same `ce_cap::authorize` the mesh host uses gates it, so
-//! the HTTP and mesh paths share one authorization rule. A missing/invalid chain on private content
-//! is a 403; a public CID needs no header.
+//! present BOTH a proof-of-possession AND a capability chain.
+//!
+//! The proof-of-possession is an `X-Ce-Proof: <expires>.<sig_hex>` header whose signature, over
+//! `(requester, cid, cdn:read, expires)`, verifies against the claimed `X-Ce-Node-Id` (see
+//! [`crate::pop`]). The capability is a hex `ce-cap` chain via `X-Ce-Capability` (or
+//! `Authorization: Capability <hex>`) that authorizes `cdn:read` for that requester.
+//!
+//! The same `ce_cap::authorize` the mesh host uses gates the chain, so the HTTP and mesh paths share
+//! one authorization rule. The proof-of-possession is what keeps `X-Ce-Node-Id` from being a
+//! forgeable bearer identity: on the mesh path the requester is the authenticated libp2p sender; on
+//! HTTP nothing else proves the caller holds the requester's key, so a leaked capability chain (it
+//! travels in a header) would otherwise be usable by anyone. A missing/invalid proof OR chain on
+//! private content is a 403; a public CID needs no header.
 //!
 //! ## Origin
 //! On a cold cache miss the server fetches the object bytes from an [`Origin`] (the content-addressed
@@ -98,9 +107,13 @@ impl<O: Origin> ServerState<O> {
     }
 }
 
-/// Parse the `from`/requester NodeId an HTTP caller claims via `X-Ce-Node-Id` (64-hex). Absent or
+/// Parse the `from`/requester NodeId an HTTP caller *claims* via `X-Ce-Node-Id` (64-hex). Absent or
 /// malformed → all-zero id (a chain whose leaf audience is some real key then simply will not match,
 /// yielding a clean 403 rather than a panic).
+///
+/// This is only a *claim*: for private content [`resolve_access`] additionally requires a
+/// proof-of-possession ([`crate::pop`]) that the caller actually holds this id's key, so the header
+/// alone never grants access.
 fn requester_id(req: &Request<Incoming>) -> [u8; 32] {
     req.headers()
         .get("x-ce-node-id")
@@ -108,6 +121,16 @@ fn requester_id(req: &Request<Incoming>) -> [u8; 32] {
         .and_then(|s| hex::decode(s.trim()).ok())
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .unwrap_or([0u8; 32])
+}
+
+/// Extract the raw `X-Ce-Proof` proof-of-possession header (`<expires>.<sig_hex>`), if present. The
+/// edge verifies this against the claimed `X-Ce-Node-Id` before trusting that id as the requester —
+/// so the id is proven, not merely asserted (see [`crate::pop`]).
+fn proof_header(req: &Request<Incoming>) -> Option<String> {
+    req.headers()
+        .get("x-ce-proof")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
 }
 
 /// Extract the hex-encoded capability chain a caller presents: `X-Ce-Capability: <hex>` or
@@ -126,21 +149,37 @@ fn capability_hex(req: &Request<Incoming>) -> String {
     String::new()
 }
 
-/// Resolve the [`Access`] decision for `cid`: public CIDs are open; otherwise the presented `ce-cap`
-/// chain must authorize `cdn:read` (rooted at this edge or an accepted root). Pure given the inputs;
-/// the caller passes the current public set, requester id, caps hex, and clock.
+/// Resolve the [`Access`] decision for `cid`: public CIDs are open; otherwise the caller must both
+/// (1) present a proof-of-possession over the requester key bound to this `(cid, cdn:read)` request,
+/// and (2) present a `ce-cap` chain that authorizes `cdn:read` for that requester (rooted at this
+/// edge or an accepted root). Pure given the inputs; the caller passes the current public set,
+/// requester id, the raw `X-Ce-Proof` header, caps hex, and clock.
+///
+/// The proof-of-possession check is what stops `X-Ce-Node-Id` from being a leakable bearer token: a
+/// capability chain that travels in a header can leak, but without the requester's private key the
+/// caller cannot mint a proof, so a leaked chain alone is useless for private content. The mesh path
+/// gets this binding for free (the libp2p sender is authenticated); the HTTP edge reconstructs it
+/// here.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_access(
     cid: &str,
     public: &PublicSet,
     edge_id: &[u8; 32],
     roots: &[[u8; 32]],
     requester: &[u8; 32],
+    proof: Option<&str>,
     caps_hex: &str,
     now: u64,
 ) -> Access {
     if public.is_public(cid) {
         return Access::Public;
     }
+    // Gate 1: prove the caller actually holds the requester key for THIS request. Without this, the
+    // capability chain below would be a pure bearer token over a forgeable `X-Ce-Node-Id` header.
+    if crate::pop::verify_pop(proof, requester, cid, proto::ABILITY_READ, now).is_err() {
+        return Access::Denied;
+    }
+    // Gate 2: the (now key-proven) requester must hold a cap chain authorizing cdn:read.
     let Ok(chain): Result<Vec<SignedCapability>, _> = decode_chain(caps_hex) else {
         return Access::Denied;
     };
@@ -251,11 +290,22 @@ async fn serve_cid<O: Origin>(
     let now = now_secs();
     let caps_hex = capability_hex(req);
     let requester = requester_id(req);
+    let proof = proof_header(req);
 
-    // Access decision first — deny cap-less private content with a 403 before touching the origin.
+    // Access decision first — deny cap-less / proof-less private content with a 403 before touching
+    // the origin.
     let access = {
         let public = state.edge.public.lock().await;
-        resolve_access(cid, &public, &state.edge_id, &state.roots, &requester, &caps_hex, now)
+        resolve_access(
+            cid,
+            &public,
+            &state.edge_id,
+            &state.roots,
+            &requester,
+            proof.as_deref(),
+            &caps_hex,
+            now,
+        )
     };
     if access == Access::Denied {
         return to_http(edge::serve(cid, &[], None, Access::Denied, &deny_cache(), now, true));
@@ -525,21 +575,22 @@ mod tests {
     fn resolve_access_public_is_open() {
         let mut p = PublicSet::new();
         p.allow_public("pub");
-        let a = resolve_access("pub", &p, &[1u8; 32], &[], &[2u8; 32], "", 0);
+        // Public CIDs need neither a proof nor a cap.
+        let a = resolve_access("pub", &p, &[1u8; 32], &[], &[2u8; 32], None, "", 0);
         assert_eq!(a, Access::Public);
     }
 
     #[test]
     fn resolve_access_private_without_caps_is_denied() {
         let p = PublicSet::new();
-        let a = resolve_access("priv", &p, &[1u8; 32], &[], &[2u8; 32], "", 0);
+        let a = resolve_access("priv", &p, &[1u8; 32], &[], &[2u8; 32], None, "", 0);
         assert_eq!(a, Access::Denied);
     }
 
     #[test]
     fn resolve_access_private_with_garbage_caps_is_denied() {
         let p = PublicSet::new();
-        let a = resolve_access("priv", &p, &[1u8; 32], &[], &[2u8; 32], "not-hex-!!", 0);
+        let a = resolve_access("priv", &p, &[1u8; 32], &[], &[2u8; 32], None, "not-hex-!!", 0);
         assert_eq!(a, Access::Denied);
     }
 
@@ -681,16 +732,113 @@ mod tests {
         // Without the cap -> 403.
         let denied = http_get(srv.addr(), "/cdn/secret", &[]).await.unwrap();
         assert_eq!(denied.status, 403);
-        // With a valid cap chain -> 200 + bytes.
+
+        // A proof-of-possession bound to (requester, cid, cdn:read), signed by the consumer's key,
+        // valid for a short window from the live clock.
+        let expires = now_secs() + 60;
+        let proof = crate::pop::mint_proof(
+            &consumer.node_id(),
+            |m| consumer.sign(m),
+            "secret",
+            proto::ABILITY_READ,
+            expires,
+        );
+
+        // With a valid cap chain AND a valid proof-of-possession -> 200 + bytes.
         let ok = http_get(
+            srv.addr(),
+            "/cdn/secret",
+            &[
+                ("X-Ce-Capability", &caps_hex),
+                ("X-Ce-Node-Id", &requester_hex),
+                ("X-Ce-Proof", &proof),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.status, 200, "body: {:?}", String::from_utf8_lossy(&ok.body));
+        assert_eq!(ok.body, b"top secret");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REGRESSION (finding H2): a request carrying a *valid* capability chain whose audience is the
+    /// claimed `X-Ce-Node-Id`, but WITHOUT a proof-of-possession, must be REJECTED for private
+    /// content. This is the leaked-bearer-token hole: under the old behavior the cap chain alone over
+    /// a forgeable `X-Ce-Node-Id` header served the bytes (200). With proof-of-possession required,
+    /// the same request is a 403. The companion test above proves the SAME cap + a real proof = 200,
+    /// so this is the proof-of-possession factor, not a broken cap.
+    #[tokio::test]
+    async fn http_private_valid_cap_but_no_proof_is_rejected() {
+        use ce_identity::Identity;
+        use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+
+        let dir =
+            std::env::temp_dir().join(format!("ce-cdn-srv-noproof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let edge = Identity::load_or_generate(&dir).unwrap();
+        let consumer_dir = dir.join("consumer");
+        std::fs::create_dir_all(&consumer_dir).unwrap();
+        let consumer = Identity::load_or_generate(&consumer_dir).unwrap();
+
+        // A legitimately-issued chain: edge -> consumer, granting cdn:read on the secret.
+        let cap = SignedCapability::issue(
+            &edge,
+            consumer.node_id(),
+            vec![proto::ABILITY_READ.to_string()],
+            Resource::Any,
+            Caveats::default(),
+            1,
+            None,
+        );
+        let caps_hex = encode_chain(&[cap]);
+
+        let state =
+            state_with(vec![("secret", b"top secret".to_vec())], &[], edge.node_id(), vec![]);
+        let srv = spawn(state).await.unwrap();
+
+        // An attacker who merely captured the leaked cap chain + the consumer's node id (both travel
+        // in headers, so both are leakable) sets them — but cannot mint a proof, since it lacks the
+        // consumer's private key. Under the OLD code this returned 200; it must now be 403.
+        let requester_hex = hex::encode(consumer.node_id());
+        let leaked = http_get(
             srv.addr(),
             "/cdn/secret",
             &[("X-Ce-Capability", &caps_hex), ("X-Ce-Node-Id", &requester_hex)],
         )
         .await
         .unwrap();
-        assert_eq!(ok.status, 200, "body: {:?}", String::from_utf8_lossy(&ok.body));
-        assert_eq!(ok.body, b"top secret");
+        assert_eq!(
+            leaked.status, 403,
+            "leaked cap chain without proof-of-possession must NOT serve private content"
+        );
+        assert!(leaked.body.is_empty() || leaked.header("content-length") == Some("0"));
+
+        // And a proof forged by a DIFFERENT key (an attacker signing the victim's challenge with its
+        // own key) must also be rejected: the signature will not verify against X-Ce-Node-Id.
+        let attacker_dir = dir.join("attacker");
+        std::fs::create_dir_all(&attacker_dir).unwrap();
+        let attacker = Identity::load_or_generate(&attacker_dir).unwrap();
+        let expires = now_secs() + 60;
+        let forged = crate::pop::mint_proof(
+            &consumer.node_id(),
+            |m| attacker.sign(m),
+            "secret",
+            proto::ABILITY_READ,
+            expires,
+        );
+        let forged_reply = http_get(
+            srv.addr(),
+            "/cdn/secret",
+            &[
+                ("X-Ce-Capability", &caps_hex),
+                ("X-Ce-Node-Id", &requester_hex),
+                ("X-Ce-Proof", &forged),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(forged_reply.status, 403, "a proof signed by the wrong key must be rejected");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

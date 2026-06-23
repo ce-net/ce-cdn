@@ -402,10 +402,36 @@ async fn http_front_end_private_gate_and_status_sizes() {
     );
     let caps_hex = encode_chain(&[cap]);
     let req_hex = hex::encode(consumer.node_id());
-    let ok = http_get(
+
+    // A leaked cap chain alone (no proof-of-possession) must NOT serve private content: the HTTP
+    // edge requires a signature over (requester, cid, cdn:read, expires) proving the caller holds
+    // the requester key. This is finding H2 — the `X-Ce-Node-Id` header is proven, not trusted.
+    let no_proof = http_get(
         srv.addr(),
         "/cdn/priv",
         &[("X-Ce-Capability", &caps_hex), ("X-Ce-Node-Id", &req_hex)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(no_proof.status, 403, "cap chain without proof-of-possession must be denied");
+
+    // With a real proof minted by the consumer's key, the same request succeeds.
+    let expires = ce_cdn::host::now_secs() + 60;
+    let proof = ce_cdn::pop::mint_proof(
+        &consumer.node_id(),
+        |m| consumer.sign(m),
+        "priv",
+        proto::ABILITY_READ,
+        expires,
+    );
+    let ok = http_get(
+        srv.addr(),
+        "/cdn/priv",
+        &[
+            ("X-Ce-Capability", &caps_hex),
+            ("X-Ce-Node-Id", &req_hex),
+            ("X-Ce-Proof", &proof),
+        ],
     )
     .await
     .unwrap();

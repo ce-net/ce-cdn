@@ -12,7 +12,7 @@
 //! The authorization decision is factored into the pure [`decide`] function so the policy is
 //! exhaustively testable without a live mesh, and the async loop only does I/O.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,6 +164,62 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A bounded set of mesh reply tokens already handled, for at-most-once request processing. The edge
+/// loop sees each gossip request potentially more than once (re-delivery), so it dedups on the reply
+/// token. A plain `HashSet` would grow without bound for the life of the process (one entry per
+/// distinct request — a slow but unbounded leak); this caps the set at `capacity` and evicts the
+/// oldest token (FIFO ring) once full. Eviction can only re-admit a token last seen `capacity`
+/// requests ago, which the 500ms poll cadence makes a non-issue in practice.
+#[derive(Debug)]
+pub struct SeenTokens {
+    set: HashSet<u64>,
+    order: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl SeenTokens {
+    /// A new bounded seen-set holding at most `capacity` tokens (FIFO eviction once full). A
+    /// `capacity` of 0 is treated as 1 so the structure always makes progress.
+    pub fn new(capacity: usize) -> Self {
+        SeenTokens {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record `token`; returns `true` if it is newly seen (the caller should process the request),
+    /// `false` if it was already present (a duplicate to skip). Evicts the oldest token when full so
+    /// memory stays bounded by `capacity` regardless of how many requests arrive.
+    pub fn insert(&mut self, token: u64) -> bool {
+        if !self.set.insert(token) {
+            return false;
+        }
+        self.order.push_back(token);
+        while self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// The number of tokens currently retained (never exceeds `capacity`).
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
+/// How many recently-handled reply tokens an edge retains for dedup before evicting the oldest. Large
+/// enough that no realistic in-flight re-delivery window re-admits a duplicate; small enough that the
+/// set's memory is a fixed, trivial ceiling (~16K * 8 bytes).
+pub const SEEN_TOKENS_CAPACITY: usize = 16_384;
+
 /// Run the edge host loop until the process is killed. The edge advertises `cdn:edge` on the DHT,
 /// polls its mesh inbox for `cdn/*` requests, authorizes each (public reads excepted), and serves.
 ///
@@ -203,7 +259,7 @@ pub async fn serve(
         "ce-cdn edge serving (cdn/cache, cdn/read, cdn/purge, cdn/status)"
     );
 
-    let mut seen: HashSet<u64> = HashSet::new();
+    let mut seen = SeenTokens::new(SEEN_TOKENS_CAPACITY);
     let mut revoked: HashSet<([u8; 32], u64)> = HashSet::new();
     let mut tick: u32 = 0;
 
@@ -490,5 +546,43 @@ mod tests {
     #[test]
     fn now_secs_is_nonzero() {
         assert!(now_secs() > 1_600_000_000); // after 2020
+    }
+
+    #[test]
+    fn seen_tokens_dedups_like_a_hashset() {
+        let mut s = SeenTokens::new(8);
+        assert!(s.insert(1)); // newly seen
+        assert!(!s.insert(1)); // duplicate
+        assert!(s.insert(2));
+        assert_eq!(s.len(), 2);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn seen_tokens_stays_bounded_under_many_requests() {
+        // REGRESSION (finding H2/MEDIUM): the edge loop's reply-token dedup set must NOT grow without
+        // bound. Feed far more distinct tokens than the capacity and assert the retained set never
+        // exceeds it. A plain HashSet (the old behavior) would hold all 100_000 entries.
+        let cap = 1_000;
+        let mut s = SeenTokens::new(cap);
+        for token in 0..100_000u64 {
+            s.insert(token);
+            assert!(s.len() <= cap, "seen-set grew past its bound: {} > {cap}", s.len());
+        }
+        assert_eq!(s.len(), cap, "a full ring retains exactly `capacity` tokens");
+        // The oldest tokens were evicted, so re-inserting one counts as newly seen again...
+        assert!(s.insert(0), "evicted token should be re-admittable");
+        // ...while the most-recent ones are still deduped.
+        assert!(!s.insert(99_999), "the newest token must still be deduped");
+    }
+
+    #[test]
+    fn seen_tokens_zero_capacity_is_clamped_to_one() {
+        let mut s = SeenTokens::new(0);
+        assert!(s.insert(7));
+        assert_eq!(s.len(), 1);
+        // The next distinct token evicts the first (capacity 1).
+        assert!(s.insert(8));
+        assert_eq!(s.len(), 1);
     }
 }

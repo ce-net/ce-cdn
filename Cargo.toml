@@ -26,6 +26,9 @@ ce-rs = { path = "../ce-rs" }
 # The capability verifier primitive — the edge host authorizes a signed attenuating chain before
 # serving private content.
 ce-cap = { path = "../ce/crates/ce-cap" }
+# Ed25519 sign/verify — the HTTP edge verifies a proof-of-possession signature so the client-set
+# `X-Ce-Node-Id` is cryptographically proven (not a leakable bearer token) before it gates access.
+ce-identity = { path = "../ce/crates/ce-identity" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
 # HTTP front-end: a real hyper 1.x server exposing GET /cdn/<cid> mapped onto the pure edge handler.
