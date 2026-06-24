@@ -22,6 +22,7 @@ use ce_rs::CeClient;
 use tokio::sync::Mutex;
 
 use crate::cache::EdgeCache;
+use crate::limits;
 use crate::proto;
 
 /// What a request is allowed to do, after evaluating the presented capability chain. The pure
@@ -121,6 +122,15 @@ impl EdgeState {
         ttl_secs: u64,
         now: u64,
     ) -> Result<u64> {
+        // Bound the size BEFORE pulling the whole object into memory: refuse to cache something that
+        // can never fit (or that exceeds the mesh ceiling) without first materializing every byte.
+        let total = self.object_total_size(ce, cid).await?;
+        {
+            let cache = self.cache.lock().await;
+            if total > cache.max_bytes() {
+                anyhow::bail!("object {cid} ({total} bytes) exceeds this edge's cache budget");
+            }
+        }
         let bytes = ce.get_object(cid).await?;
         let len = bytes.len() as u64;
         let mut cache = self.cache.lock().await;
@@ -133,6 +143,10 @@ impl EdgeState {
 
     /// Read `cid` from the hot cache at `now`, returning `(bytes, cache_hit)`. On a cold miss it
     /// fetches from the origin, caches it, and returns the bytes with `cache_hit = false`.
+    ///
+    /// The whole-object size is bounded by [`limits::MAX_MESH_OBJECT_BYTES`]: an object larger than
+    /// the mesh reply ceiling is refused (it must be fetched over HTTP or by range), so a single
+    /// `cdn/read` can never balloon the reply past the SDK wire limit or OOM either end.
     pub async fn read_object(
         &self,
         ce: &CeClient,
@@ -145,13 +159,101 @@ impl EdgeState {
                 return Ok((bytes, true));
             }
         }
-        // Cold: fetch and cache (best-effort cache; serve regardless).
+        // Cold: peek the manifest to bound the size BEFORE pulling the whole object.
+        let total = self.object_total_size(ce, cid).await?;
+        if total > limits::MAX_MESH_OBJECT_BYTES {
+            anyhow::bail!(
+                "object {cid} ({total} bytes) exceeds the mesh read limit ({} bytes); fetch by range or over HTTP",
+                limits::MAX_MESH_OBJECT_BYTES
+            );
+        }
         let bytes = ce.get_object(cid).await?;
         {
             let mut cache = self.cache.lock().await;
             let _ = cache.insert(cid, bytes.clone(), now);
         }
         Ok((bytes, false))
+    }
+
+    /// Resolve just an object's total size from its manifest (a single small blob fetch), without
+    /// pulling any chunk bytes. Used to bound a read before committing to the full transfer.
+    async fn object_total_size(&self, ce: &CeClient, cid: &str) -> Result<u64> {
+        let manifest_bytes = ce.get_blob(cid).await?;
+        let manifest: ce_rs::data::Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| anyhow!("{cid} is not a v1 object manifest: {e}"))?;
+        if !manifest.is_v1() {
+            anyhow::bail!("unsupported manifest kind: {}", manifest.kind);
+        }
+        Ok(manifest.total_size)
+    }
+
+    /// Read only the bytes covering `range` of `cid` (manifest-aware partial fetch), returning
+    /// `(range_bytes, cache_hit)`. If the whole object is already hot-cached, slice from it (a true
+    /// cache hit). Otherwise fetch ONLY the covering chunks from the blob store, verify each against
+    /// its CID, and slice — so a 1-byte range over a 1 GiB object pulls one chunk, not the whole
+    /// object. The covering-chunk byte span is bounded by [`limits::MAX_MESH_RANGE_BYTES`].
+    pub async fn read_range(
+        &self,
+        ce: &CeClient,
+        cid: &str,
+        range: crate::cidrange::ByteRange,
+        now: u64,
+    ) -> Result<(Vec<u8>, bool)> {
+        // Hot path: if the whole object is cached, slice directly.
+        {
+            let mut cache = self.cache.lock().await;
+            if let Some(bytes) = cache.get(cid, now)
+                && (range.end as usize) < bytes.len()
+            {
+                return Ok((bytes[range.start as usize..=range.end as usize].to_vec(), true));
+            }
+        }
+        // Cold range: pull only covering chunks.
+        let manifest_bytes = ce.get_blob(cid).await?;
+        let manifest: ce_rs::data::Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| anyhow!("{cid} is not a v1 object manifest: {e}"))?;
+        if !manifest.is_v1() {
+            anyhow::bail!("unsupported manifest kind: {}", manifest.kind);
+        }
+        let span = crate::cidrange::chunks_for_range(&manifest, range)
+            .ok_or_else(|| anyhow!("manifest {cid} has zero chunk_size"))?;
+        // Bound the covering-chunk byte span we will materialize.
+        let covering_chunks = span.last_chunk.saturating_sub(span.first_chunk).saturating_add(1);
+        let covering_bytes = covering_chunks.saturating_mul(manifest.chunk_size);
+        if covering_bytes > limits::MAX_MESH_RANGE_BYTES {
+            anyhow::bail!(
+                "range covers {covering_bytes} bytes, exceeding the mesh range limit ({} bytes)",
+                limits::MAX_MESH_RANGE_BYTES
+            );
+        }
+        let joined = self.fetch_chunks(ce, &manifest, span).await?;
+        let sliced = crate::cidrange::slice_span(&joined, span)?;
+        Ok((sliced, false))
+    }
+
+    /// Pull chunks `span.first_chunk..=span.last_chunk` from the blob store, verifying each against
+    /// its CID (trustless), and return them concatenated.
+    async fn fetch_chunks(
+        &self,
+        ce: &CeClient,
+        manifest: &ce_rs::data::Manifest,
+        span: crate::cidrange::ChunkSpan,
+    ) -> Result<Vec<u8>> {
+        if manifest.chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let last = (span.last_chunk as usize).min(manifest.chunks.len() - 1);
+        let first = (span.first_chunk as usize).min(last);
+        let mut out = Vec::new();
+        for chunk_cid in &manifest.chunks[first..=last] {
+            let chunk = ce.get_blob(chunk_cid).await?;
+            let got = ce_rs::cid(&chunk);
+            if got != *chunk_cid {
+                anyhow::bail!("chunk verification failed: expected {chunk_cid}, got {got}");
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 }
 
@@ -369,13 +471,28 @@ async fn handle_inner(
     roots: &[[u8; 32]],
     revoked: &HashSet<([u8; 32], u64)>,
 ) -> Result<Vec<u8>> {
+    // Bound the inbound payload BEFORE decoding so a hostile oversized request cannot exhaust memory
+    // on decode. The hex on the wire is 2x the decoded size.
+    if payload_hex.len() > limits::MAX_REQUEST_BYTES.saturating_mul(2) {
+        return Err(anyhow!("request payload too large"));
+    }
     let payload = hex::decode(payload_hex).context("payload hex")?;
+    if payload.len() > limits::MAX_REQUEST_BYTES {
+        return Err(anyhow!("request payload too large"));
+    }
     let from: [u8; 32] = hex::decode(from_hex)
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| anyhow!("bad sender id"))?;
     let ability = ability_for(topic).ok_or_else(|| anyhow!("unknown cdn topic '{topic}'"))?;
     let (caps, cid) = caps_and_cid(&payload)?;
+    // Validate the CID and cap-chain shape up front so malformed keys never reach the cache/origin.
+    if !limits::is_valid_cid(&cid) {
+        return Err(anyhow!(proto::denied("malformed cid")));
+    }
+    if caps.len() > limits::MAX_CAPS_HEX_LEN {
+        return Err(anyhow!(proto::denied("capability chain too large")));
+    }
 
     // Build the authorizer closure that `decide` consults for non-public actions.
     let is_public = state.public.lock().await.is_public(&cid);
@@ -445,12 +562,63 @@ async fn handle_inner(
 
 /// Serve a read (whole object or a range) from the edge, fetching+caching on a cold miss. The bytes
 /// are hex-encoded into the reply; the consumer re-verifies against the CID, so this is trustless.
+///
+/// A whole-object read is bounded by [`limits::MAX_MESH_OBJECT_BYTES`]; a range read fetches ONLY the
+/// covering chunks (manifest-aware) and is bounded by [`limits::MAX_MESH_RANGE_BYTES`]. So a range
+/// over a huge object pulls one chunk, and no single reply can balloon past the mesh wire ceiling.
 async fn do_read(
     client: &CeClient,
     state: &EdgeState,
     req: &proto::ReadReq,
     now: u64,
 ) -> proto::ReadResp {
+    // Resolve the requested range against the object's true total size (a small manifest peek) so a
+    // range read never has to materialize the whole object first.
+    if let Some(range_hdr) = req.range.as_deref() {
+        let total = match state.object_total_size(client, &req.cid).await {
+            Ok(t) => t,
+            Err(e) => {
+                return proto::ReadResp {
+                    ok: false,
+                    reason: Some(format!("not retrievable: {e}")),
+                    ..Default::default()
+                };
+            }
+        };
+        match crate::cidrange::parse_range(Some(range_hdr), total) {
+            crate::cidrange::RangeOutcome::Full => {} // fall through to whole-object read below
+            crate::cidrange::RangeOutcome::Partial(r) => {
+                return match state.read_range(client, &req.cid, r, now).await {
+                    Ok((bytes, cache_hit)) => proto::ReadResp {
+                        ok: true,
+                        bytes_hex: hex::encode(&bytes),
+                        total_len: total,
+                        partial: true,
+                        range_start: r.start,
+                        range_end: r.end,
+                        cache_hit,
+                        ..Default::default()
+                    },
+                    Err(e) => proto::ReadResp {
+                        ok: false,
+                        total_len: total,
+                        reason: Some(format!("range read failed: {e}")),
+                        ..Default::default()
+                    },
+                };
+            }
+            crate::cidrange::RangeOutcome::Unsatisfiable => {
+                return proto::ReadResp {
+                    ok: false,
+                    total_len: total,
+                    reason: Some(format!("range not satisfiable for {total} bytes")),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+
+    // Whole-object read (no range, or a range that resolved to Full).
     let (bytes, cache_hit) = match state.read_object(client, &req.cid, now).await {
         Ok(v) => v,
         Err(e) => {
@@ -462,31 +630,13 @@ async fn do_read(
         }
     };
     let total = bytes.len() as u64;
-    match crate::cidrange::parse_range(req.range.as_deref(), total) {
-        crate::cidrange::RangeOutcome::Full => proto::ReadResp {
-            ok: true,
-            bytes_hex: hex::encode(&bytes),
-            total_len: total,
-            partial: false,
-            cache_hit,
-            ..Default::default()
-        },
-        crate::cidrange::RangeOutcome::Partial(r) => proto::ReadResp {
-            ok: true,
-            bytes_hex: hex::encode(&bytes[r.start as usize..=r.end as usize]),
-            total_len: total,
-            partial: true,
-            range_start: r.start,
-            range_end: r.end,
-            cache_hit,
-            ..Default::default()
-        },
-        crate::cidrange::RangeOutcome::Unsatisfiable => proto::ReadResp {
-            ok: false,
-            total_len: total,
-            reason: Some(format!("range not satisfiable for {total} bytes")),
-            ..Default::default()
-        },
+    proto::ReadResp {
+        ok: true,
+        bytes_hex: hex::encode(&bytes),
+        total_len: total,
+        partial: false,
+        cache_hit,
+        ..Default::default()
     }
 }
 
@@ -584,5 +734,35 @@ mod tests {
         // The next distinct token evicts the first (capacity 1).
         assert!(s.insert(8));
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn caps_and_cid_extracts_head_fields() {
+        let (caps, cid) = caps_and_cid(br#"{"caps":"dead","cid":"beef","range":"bytes=0-1"}"#).unwrap();
+        assert_eq!(caps, "dead");
+        assert_eq!(cid, "beef");
+        // Missing cid is an error, not a panic.
+        assert!(caps_and_cid(br#"{"caps":"x"}"#).is_err());
+        // Absent caps defaults to empty.
+        let (caps2, cid2) = caps_and_cid(br#"{"cid":"abc"}"#).unwrap();
+        assert_eq!(caps2, "");
+        assert_eq!(cid2, "abc");
+    }
+
+    #[test]
+    fn ability_for_maps_topics() {
+        assert_eq!(ability_for(proto::TOPIC_CACHE), Some(proto::ABILITY_CACHE));
+        assert_eq!(ability_for(proto::TOPIC_READ), Some(proto::ABILITY_READ));
+        assert_eq!(ability_for(proto::TOPIC_PURGE), Some(proto::ABILITY_PURGE));
+        assert_eq!(ability_for(proto::TOPIC_STATUS), Some(proto::ABILITY_READ));
+        assert_eq!(ability_for("cdn/unknown"), None);
+    }
+
+    #[test]
+    fn cid_validation_gates_requests() {
+        // The host validates the CID before any cache/origin work; a real CID is 64 lowercase hex.
+        assert!(limits::is_valid_cid(&"a".repeat(64)));
+        assert!(!limits::is_valid_cid("not-a-real-cid"));
+        assert!(!limits::is_valid_cid(&"a".repeat(63)));
     }
 }

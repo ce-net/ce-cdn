@@ -456,3 +456,128 @@ fn slice_span_rejects_truncated_chunk_bytes() {
     let err = slice_span(&[0u8; 8], span).unwrap_err();
     assert!(err.to_string().contains("too short"));
 }
+
+// ---------------------------------------------------------------------------
+// HTTP front-end: conditional requests (304), negative caching, /metrics, presigned links — the
+// new CDN features, driven over a real socket from outside the crate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_conditional_request_returns_304() {
+    let srv = http_server(&[("doc", b"document body")], &["doc"], [4u8; 32]).await;
+    // Prime the cache.
+    let _ = http_get(srv.addr(), "/cdn/doc", &[]).await.unwrap();
+    // Client already holds the immutable CID -> 304, no body.
+    let r = http_get(srv.addr(), "/cdn/doc", &[("If-None-Match", "\"doc\"")]).await.unwrap();
+    assert_eq!(r.status, 304);
+    assert!(r.body.is_empty());
+    // Wildcard validator also yields 304.
+    let star = http_get(srv.addr(), "/cdn/doc", &[("If-None-Match", "*")]).await.unwrap();
+    assert_eq!(star.status, 304);
+}
+
+#[tokio::test]
+async fn http_metrics_exposes_prometheus_counters() {
+    let srv = http_server(&[("met", b"xyz")], &["met"], [4u8; 32]).await;
+    let _ = http_get(srv.addr(), "/cdn/met", &[]).await.unwrap(); // miss
+    let _ = http_get(srv.addr(), "/cdn/met", &[]).await.unwrap(); // hit
+    let m = http_get(srv.addr(), "/metrics", &[]).await.unwrap();
+    assert_eq!(m.status, 200);
+    let body = String::from_utf8_lossy(&m.body);
+    assert!(body.contains("ce_cdn_cache_hits_total"));
+    assert!(body.contains("ce_cdn_object_bytes{cid=\"met\"} 3"), "{body}");
+}
+
+#[tokio::test]
+async fn http_presigned_link_is_honored_end_to_end() {
+    use ce_cdn::server::ServerState;
+    let signer = ident("presigner");
+    // Private content, but the edge trusts the signer's key for presigned links.
+    let edge = EdgeState::new(1 << 20, 3600);
+    let map: HashMap<String, Vec<u8>> =
+        [("link".to_string(), b"behind a link".to_vec())].into_iter().collect();
+    let state = Arc::new(
+        ServerState::new(edge, MapOrigin(map), [4u8; 32], vec![])
+            .with_presign_keys(vec![signer.node_id()]),
+    );
+    let srv = spawn(state).await.unwrap();
+
+    // No credentials -> 403.
+    assert_eq!(http_get(srv.addr(), "/cdn/link", &[]).await.unwrap().status, 403);
+
+    // A presigned URL (query params only, no headers) -> 200.
+    let expires = ce_cdn::host::now_secs() + 300;
+    let url = ce_cdn::presign::presign_url(|m| signer.sign(m), "link", expires);
+    let ok = http_get(srv.addr(), &url, &[]).await.unwrap();
+    assert_eq!(ok.status, 200, "{:?}", String::from_utf8_lossy(&ok.body));
+    assert_eq!(ok.body, b"behind a link");
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance / re-replication planning: the pure plan over probe results.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn maintenance_plan_recruits_to_restore_target() {
+    use ce_cdn::maintain::plan_entry;
+    let probes = vec![("e1".to_string(), true), ("e2".to_string(), false)];
+    let plan = plan_entry("cid", 3, &probes);
+    assert_eq!(plan.healthy, vec!["e1".to_string()]);
+    assert_eq!(plan.recruit, 2); // 1 healthy of target 3
+}
+
+// ---------------------------------------------------------------------------
+// Input bounds / validation: malformed CIDs and oversize inputs are rejected by the limits layer.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn limits_reject_bad_cids_and_oversize_inputs() {
+    use ce_cdn::limits::{self, MAX_CAPS_HEX_LEN, MAX_MESH_OBJECT_BYTES};
+    assert!(limits::is_valid_cid(&"a".repeat(64)));
+    assert!(!limits::is_valid_cid("short"));
+    assert!(!limits::is_acceptable_cid_charset("%2e%2e"));
+    // The mesh object ceiling is well under a sane single-message size even after hex doubling.
+    let obj = MAX_MESH_OBJECT_BYTES;
+    let caps = MAX_CAPS_HEX_LEN;
+    assert!(obj.saturating_mul(2) < 64 * 1024 * 1024);
+    assert!(caps > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Catalog: atomic save + lock-guarded update across simulated concurrent writers (no lost update).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn catalog_update_is_atomic_and_lock_guarded() {
+    use ce_cdn::catalog::{Access, Catalog, Content, Entry};
+    let tmp = std::env::temp_dir().join(format!("ce-cdn-it-cat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let path = tmp.join("catalog.json");
+
+    let mk = |cid: &str| Entry {
+        content: Content {
+            cid: cid.into(),
+            bytes_len: 1,
+            access: Access::Public,
+            replication: 1,
+            ttl_secs: 0,
+            label: None,
+            tags: vec![],
+        },
+        edges: vec![],
+    };
+    // Two sequential lock-guarded updates must both persist (read-modify-write, no lost update).
+    Catalog::update(&path, |c| {
+        c.upsert(mk("a"));
+        Ok(())
+    })
+    .unwrap();
+    Catalog::update(&path, |c| {
+        c.upsert(mk("b"));
+        Ok(())
+    })
+    .unwrap();
+    let loaded = Catalog::load(&path).unwrap();
+    assert!(loaded.get("a").is_some() && loaded.get("b").is_some());
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -53,6 +53,9 @@ enum Cmd {
         /// Optional human label for `ce-cdn ls`.
         #[arg(long)]
         label: Option<String>,
+        /// Tag for invalidation-by-tag (`ce-cdn purge --tag T` evicts every CID tagged T). Repeatable.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
         /// Capability chain (hex) to present to edges; overrides $CE_CDN_CAPS / config file.
         #[arg(long)]
         caps: Option<String>,
@@ -73,11 +76,15 @@ enum Cmd {
     },
     /// List published content and its edge-replica health.
     Ls,
-    /// Evict content from edges (and forget it locally). Targets recorded edges unless --edge given.
+    /// Evict content from edges (and forget it locally). Targets recorded + DHT-advertised edges
+    /// unless --edge given; --tag purges every CID with that tag.
     Purge {
-        /// The object CID to purge.
-        cid: String,
-        /// Purge from a specific edge NodeId only (default: all recorded edges).
+        /// The object CID to purge (omit when using --tag).
+        cid: Option<String>,
+        /// Purge every CID tagged with this tag (bulk invalidation).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Purge from a specific edge NodeId only (default: all recorded + advertised edges).
         #[arg(long)]
         edge: Option<String>,
         /// Capability chain (hex) granting `cdn:purge` on the edges.
@@ -86,6 +93,35 @@ enum Cmd {
         /// Keep the catalog entry (only evict from edges, do not forget locally).
         #[arg(long)]
         keep: bool,
+    },
+    /// Force-forget a CID from the local catalog without contacting any edge (for a deployment whose
+    /// host is permanently unreachable). Does NOT evict from edges — use `purge` for that.
+    Forget {
+        /// The object CID to drop from the catalog.
+        cid: String,
+    },
+    /// Run the re-replication maintenance loop: probe each recorded object's edges and re-cache to
+    /// restore its target replication factor. One pass by default; --watch loops forever.
+    Maintain {
+        /// Capability chain (hex) presented to edges for status/cache during maintenance.
+        #[arg(long)]
+        caps: Option<String>,
+        /// Loop forever, sleeping this many seconds between passes (default: one pass and exit).
+        #[arg(long)]
+        watch: Option<u64>,
+    },
+    /// Mint a presigned, time-limited public link for a CID, signed by the local node's key. Anyone
+    /// with the link can fetch until it expires — no client key needed (the Cloud-CDN signed-URL
+    /// analog). The serving edge must trust this node's key (`--presign-key`).
+    Presign {
+        /// The object CID to sign a link for.
+        cid: String,
+        /// Link lifetime in seconds (default: 1 hour).
+        #[arg(long, default_value_t = 3600)]
+        ttl: u64,
+        /// Optional `scheme://host:port` to prepend so the printed link is directly clickable.
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Check which edges currently hold a CID (cheap status probe across recorded + advertised edges).
     Status {
@@ -107,9 +143,13 @@ enum Cmd {
         #[arg(long = "public")]
         public: Vec<String>,
         /// Also run the HTTP front-end on this address (e.g. `127.0.0.1:8845`), exposing
-        /// `GET /cdn/<cid>` (+ `/status`, `/health`). Omit to run mesh-only.
+        /// `GET /cdn/<cid>` (+ `/status`, `/health`, `/metrics`). Omit to run mesh-only.
         #[arg(long)]
         http: Option<std::net::SocketAddr>,
+        /// Publisher NodeId (64-hex) whose presigned links this edge honors over HTTP. Repeatable.
+        /// With none set, presigned links are disabled and private content needs PoP + a cap chain.
+        #[arg(long = "presign-key")]
+        presign_keys: Vec<String>,
     },
 }
 
@@ -121,7 +161,7 @@ async fn main() -> Result<()> {
     let catalog_path = cli.catalog.clone().unwrap_or_else(Catalog::default_path);
 
     match cli.cmd {
-        Cmd::Put { file, replication, ttl, private, label, caps: caps_arg, no_replicate } => {
+        Cmd::Put { file, replication, ttl, private, label, tags, caps: caps_arg, no_replicate } => {
             cmd_put(
                 ce,
                 &catalog_path,
@@ -130,6 +170,7 @@ async fn main() -> Result<()> {
                 ttl,
                 private,
                 label,
+                tags,
                 caps_arg.as_deref(),
                 no_replicate,
             )
@@ -137,15 +178,20 @@ async fn main() -> Result<()> {
         }
         Cmd::Get { cid, out, range } => cmd_get(ce, &cid, out, range.as_deref()).await,
         Cmd::Ls => cmd_ls(&catalog_path),
-        Cmd::Purge { cid, edge, caps: caps_arg, keep } => {
-            cmd_purge(ce, &catalog_path, &cid, edge.as_deref(), caps_arg.as_deref(), keep).await
+        Cmd::Purge { cid, tag, edge, caps: caps_arg, keep } => {
+            cmd_purge(ce, &catalog_path, cid, tag, edge.as_deref(), caps_arg.as_deref(), keep).await
         }
+        Cmd::Forget { cid } => cmd_forget(&catalog_path, &cid),
         Cmd::Status { cid, caps: caps_arg } => {
             cmd_status(ce, &catalog_path, &cid, caps_arg.as_deref()).await
         }
-        Cmd::Serve { max_mb, ttl, public, http } => {
+        Cmd::Maintain { caps: caps_arg, watch } => {
+            cmd_maintain(ce, &catalog_path, caps_arg.as_deref(), watch).await
+        }
+        Cmd::Presign { cid, ttl, base } => cmd_presign(ce, &cid, ttl, base.as_deref()).await,
+        Cmd::Serve { max_mb, ttl, public, http, presign_keys } => {
             let max_bytes = max_mb.saturating_mul(1024 * 1024);
-            cmd_serve(ce, max_bytes, ttl, public, http).await
+            cmd_serve(ce, max_bytes, ttl, public, http, presign_keys).await
         }
     }
 }
@@ -159,6 +205,7 @@ async fn cmd_serve(
     ttl: u64,
     public: Vec<String>,
     http: Option<std::net::SocketAddr>,
+    presign_keys_hex: Vec<String>,
 ) -> Result<()> {
     let roots = load_roots();
     let Some(addr) = http else {
@@ -176,6 +223,8 @@ async fn cmd_serve(
         .and_then(|b| b.try_into().ok())
         .context("node returned a malformed node id")?;
 
+    let presign_keys = parse_node_ids(&presign_keys_hex)?;
+
     let edge = EdgeState::new(max_bytes, ttl);
     {
         let mut p = edge.public.lock().await;
@@ -183,9 +232,28 @@ async fn cmd_serve(
             p.allow_public(cid);
         }
     }
-    let state = Arc::new(ServerState::new(edge, CeOrigin::new(ce), edge_id, roots));
-    println!("ce-cdn HTTP front-end on http://{addr}  (GET /cdn/<cid>, /status, /health)");
+    let state = Arc::new(
+        ServerState::new(edge, CeOrigin::new(ce), edge_id, roots)
+            .with_presign_keys(presign_keys)
+            .with_max_object_bytes(max_bytes),
+    );
+    println!(
+        "ce-cdn HTTP front-end on http://{addr}  (GET /cdn/<cid>, /status, /health, /metrics)"
+    );
     ce_cdn::server::run(addr, state).await
+}
+
+/// Parse a list of 64-hex NodeId strings into `[u8; 32]`, failing on the first malformed entry.
+fn parse_node_ids(hexes: &[String]) -> Result<Vec<[u8; 32]>> {
+    hexes
+        .iter()
+        .map(|h| {
+            hex::decode(h.trim())
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or_else(|| anyhow::anyhow!("'{h}' is not a 64-hex node id"))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,6 +265,7 @@ async fn cmd_put(
     ttl: u64,
     private: bool,
     label: Option<String>,
+    tags: Vec<String>,
     caps_arg: Option<&str>,
     no_replicate: bool,
 ) -> Result<()> {
@@ -208,7 +277,6 @@ async fn cmd_put(
     println!("  url: {}", put.url);
 
     let access = if private { Access::Private } else { Access::Public };
-    let mut catalog = Catalog::load(catalog_path)?;
     let mut edges: Vec<EdgeReplica> = Vec::new();
 
     if !no_replicate && replication > 0 {
@@ -238,18 +306,21 @@ async fn cmd_put(
         }
     }
 
-    catalog.upsert(Entry {
-        content: Content {
-            cid: put.cid.clone(),
-            bytes_len: put.bytes_len,
-            access,
-            replication,
-            ttl_secs: ttl,
-            label,
-        },
-        edges,
-    });
-    catalog.save(catalog_path)?;
+    Catalog::update(catalog_path, |catalog| {
+        catalog.upsert(Entry {
+            content: Content {
+                cid: put.cid.clone(),
+                bytes_len: put.bytes_len,
+                access,
+                replication,
+                ttl_secs: ttl,
+                label,
+                tags,
+            },
+            edges,
+        });
+        Ok(())
+    })?;
     println!("recorded in {}", catalog_path.display());
     Ok(())
 }
@@ -291,13 +362,14 @@ fn cmd_ls(catalog_path: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<66}  {:>10}  {:>7}  {:>5}  {:>8}  LABEL",
-        "CID", "BYTES", "ACCESS", "REPL", "HEALTHY"
+        "{:<66}  {:>10}  {:>7}  {:>5}  {:>8}  {:<16}  TAGS",
+        "CID", "BYTES", "ACCESS", "REPL", "HEALTHY", "LABEL"
     );
     for (cid, e) in &catalog.items {
         let access = if e.content.access.is_public() { "public" } else { "private" };
+        let tags = if e.content.tags.is_empty() { "-".to_string() } else { e.content.tags.join(",") };
         println!(
-            "{:<66}  {:>10}  {:>7}  {:>5}  {:>4}/{:<3}  {}",
+            "{:<66}  {:>10}  {:>7}  {:>5}  {:>4}/{:<3}  {:<16}  {}",
             cid,
             e.content.bytes_len,
             access,
@@ -305,15 +377,18 @@ fn cmd_ls(catalog_path: &std::path::Path) -> Result<()> {
             e.healthy_edges(),
             e.edges.len(),
             e.content.label.as_deref().unwrap_or("-"),
+            tags,
         );
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_purge(
     ce: CeClient,
     catalog_path: &std::path::Path,
-    cid: &str,
+    cid: Option<String>,
+    tag: Option<String>,
     edge: Option<&str>,
     caps_arg: Option<&str>,
     keep: bool,
@@ -321,41 +396,149 @@ async fn cmd_purge(
     let client = CdnClient::new(ce);
     let caps_hex = caps::resolve(caps_arg);
 
-    // Determine which edges to purge from: the explicit one, else all recorded edges.
-    let edges: Vec<String> = match edge {
-        Some(e) => vec![e.to_string()],
-        None => Catalog::load(catalog_path)?
-            .get(cid)
-            .map(|entry| entry.edge_ids())
-            .unwrap_or_default(),
+    // Resolve the set of CIDs to purge: explicit CID, or every CID with the given tag.
+    let cids: Vec<String> = match (&cid, &tag) {
+        (Some(c), _) => vec![c.clone()],
+        (None, Some(t)) => {
+            let cids = Catalog::load(catalog_path)?.cids_with_tag(t);
+            if cids.is_empty() {
+                println!("no content tagged '{t}'");
+                return Ok(());
+            }
+            println!("purging {} CID(s) tagged '{t}'", cids.len());
+            cids
+        }
+        (None, None) => anyhow::bail!("provide a CID or --tag"),
     };
 
-    if edges.is_empty() {
-        println!("{cid}: no edges to purge (no recorded replicas; pass --edge to target one)");
-    } else {
-        let mut purged = 0usize;
-        for e in &edges {
-            let short = &e[..16.min(e.len())];
-            match client.purge_at(e, cid, &caps_hex).await {
-                Ok(r) if r.purged => {
-                    purged += 1;
-                    println!("  {short}… purged");
+    for cid in &cids {
+        // Fan out to ALL edges: explicit one, else recorded replicas UNION DHT-advertised holders
+        // (an edge advertising cdn:<cid> that isn't in our local catalog still gets purged).
+        let edges: Vec<String> = match edge {
+            Some(e) => vec![e.to_string()],
+            None => {
+                let mut set: Vec<String> = Catalog::load(catalog_path)?
+                    .get(cid)
+                    .map(|entry| entry.edge_ids())
+                    .unwrap_or_default();
+                if let Ok(adv) = client.ce().find_service(&ce_cdn::proto::service_for(cid)).await {
+                    for a in adv {
+                        if !set.contains(&a) {
+                            set.push(a);
+                        }
+                    }
                 }
-                Ok(r) => println!("  {short}… not held{}", reason_suffix(r.reason)),
-                Err(err) => println!("  {short}… error: {err}"),
+                set
             }
-        }
-        println!("purged from {purged}/{} edge(s)", edges.len());
-    }
+        };
 
-    if !keep {
-        let mut catalog = Catalog::load(catalog_path)?;
-        if catalog.remove(cid).is_some() {
-            catalog.save(catalog_path)?;
-            println!("forgot {cid} from the catalog");
+        if edges.is_empty() {
+            println!("{cid}: no edges to purge (no recorded/advertised replicas)");
+        } else {
+            let mut purged = 0usize;
+            for e in &edges {
+                let short = &e[..16.min(e.len())];
+                match client.purge_at(e, cid, &caps_hex).await {
+                    Ok(r) if r.purged => {
+                        purged += 1;
+                        println!("  {cid} {short}… purged");
+                    }
+                    Ok(r) => println!("  {cid} {short}… not held{}", reason_suffix(r.reason)),
+                    Err(err) => println!("  {cid} {short}… error: {err}"),
+                }
+            }
+            println!("{cid}: purged from {purged}/{} edge(s)", edges.len());
+        }
+
+        if !keep {
+            Catalog::update(catalog_path, |catalog| {
+                if catalog.remove(cid).is_some() {
+                    println!("forgot {cid} from the catalog");
+                }
+                Ok(())
+            })?;
         }
     }
     Ok(())
+}
+
+/// Force-forget a CID locally without contacting any edge — for a deployment whose host is gone.
+fn cmd_forget(catalog_path: &std::path::Path, cid: &str) -> Result<()> {
+    Catalog::update(catalog_path, |catalog| {
+        if catalog.remove(cid).is_some() {
+            println!("forgot {cid} from the catalog (no edges contacted)");
+        } else {
+            println!("{cid} was not in the catalog");
+        }
+        Ok(())
+    })
+}
+
+/// Run the re-replication maintenance loop: one pass, or forever with `--watch`.
+async fn cmd_maintain(
+    ce: CeClient,
+    catalog_path: &std::path::Path,
+    caps_arg: Option<&str>,
+    watch: Option<u64>,
+) -> Result<()> {
+    let client = CdnClient::new(ce);
+    let caps_hex = caps::resolve(caps_arg);
+    match watch {
+        Some(interval) => {
+            ce_cdn::maintain::run_forever(&client, catalog_path, &caps_hex, interval).await
+        }
+        None => {
+            let report = ce_cdn::maintain::run_once(&client, catalog_path, &caps_hex).await?;
+            println!(
+                "maintenance: examined {} object(s), recruited {} new replica(s), {} shortfall(s)",
+                report.examined, report.recruited, report.shortfalls
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Mint a presigned, time-limited public link for a CID, signed with the local CE identity key (read
+/// from the node's data dir). The signer's NodeId must be configured as a trusted `--presign-key` on
+/// the serving edge. This is a purely local, offline operation (no node API call needed).
+async fn cmd_presign(
+    _ce: CeClient,
+    cid: &str,
+    ttl: u64,
+    base: Option<&str>,
+) -> Result<()> {
+    if !ce_cdn::limits::is_valid_cid(cid) {
+        anyhow::bail!("'{cid}' is not a valid 64-hex content id");
+    }
+    let identity = load_identity().context("loading the local CE identity for presigning")?;
+    let expires = ce_cdn::host::now_secs().saturating_add(ttl);
+    let url_path = ce_cdn::presign::presign_url(|m| identity.sign(m), cid, expires);
+    match base {
+        Some(b) => println!("{}{url_path}", b.trim_end_matches('/')),
+        None => println!("{url_path}"),
+    }
+    let signer = identity.node_id_hex();
+    eprintln!(
+        "presigned by {}… valid for {ttl}s (edge must trust this key via --presign-key {})",
+        &signer[..16.min(signer.len())],
+        signer
+    );
+    Ok(())
+}
+
+/// Load the local CE identity (the Ed25519 key the node uses), from `$CE_DATA_DIR/identity` else
+/// `~/.local/share/ce/identity` — the same location the node and ce-pin read.
+fn load_identity() -> Result<ce_identity::Identity> {
+    use std::path::PathBuf;
+    let dir = std::env::var_os("CE_DATA_DIR")
+        .map(|d| PathBuf::from(d).join("identity"))
+        .or_else(|| {
+            directories::ProjectDirs::from("", "", "ce")
+                .map(|p| p.data_dir().join("identity"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("could not locate the CE data dir"))?;
+    ce_identity::Identity::load_or_generate(&dir)
+        .with_context(|| format!("loading identity from {}", dir.display()))
 }
 
 async fn cmd_status(
@@ -400,15 +583,15 @@ async fn cmd_status(
     }
     println!("served by {live}/{} edge(s)", all.len());
 
-    // Reflect freshly-measured health into the catalog if we track this CID.
-    if let Ok(mut catalog) = Catalog::load(catalog_path)
-        && let Some(entry) = catalog.get_mut(cid)
-    {
-        for r in entry.edges.iter_mut() {
-            r.healthy = advertised.contains(&r.edge);
+    // Reflect freshly-measured health into the catalog if we track this CID (atomic, under lock).
+    let _ = Catalog::update(catalog_path, |catalog| {
+        if let Some(entry) = catalog.get_mut(cid) {
+            for r in entry.edges.iter_mut() {
+                r.healthy = advertised.contains(&r.edge);
+            }
         }
-        let _ = catalog.save(catalog_path);
-    }
+        Ok(())
+    });
     Ok(())
 }
 

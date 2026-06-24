@@ -148,6 +148,28 @@ pub fn serve(
     }
 }
 
+/// Does an `If-None-Match` header value match the strong ETag `"<cid>"` for this object? Because a
+/// CID is immutable, a matching `If-None-Match` means the client already has the exact bytes, so the
+/// edge can answer `304 Not Modified` with no body — the single biggest CDN bandwidth win, and free
+/// here. Accepts a comma-separated list of entity-tags and the wildcard `*` (RFC 7232 §3.2). Weak
+/// validators (`W/"..."`) are compared on the opaque tag only.
+pub fn if_none_match_matches(header: Option<&str>, cid: &str) -> bool {
+    let Some(h) = header else { return false };
+    let etag = format!("\"{cid}\"");
+    h.split(',').any(|raw| {
+        let t = raw.trim();
+        let t = t.strip_prefix("W/").unwrap_or(t).trim();
+        t == "*" || t == etag
+    })
+}
+
+/// A `304 Not Modified` response for `cid`: the client's cached copy is still valid (immutable CID),
+/// so re-send only the validators and cache directives, never the body.
+pub fn not_modified(cid: &str, cache: &EdgeCache, now: u64) -> EdgeResponse {
+    let headers = cache_headers(cid, cache, now, true);
+    EdgeResponse { status: 304, headers, body: Body::None }
+}
+
 /// The response for a CID the edge does not hold and could not obtain — a plain 404.
 pub fn not_found(cid: &str) -> EdgeResponse {
     EdgeResponse {
@@ -265,6 +287,27 @@ mod tests {
         assert_eq!(resp.header("Age"), Some("50"));
         // ttl remaining at t=150 is 3600-(150-100)=3550
         assert!(resp.header("Cache-Control").unwrap().contains("max-age=3550"));
+    }
+
+    #[test]
+    fn if_none_match_matches_strong_weak_and_wildcard() {
+        assert!(if_none_match_matches(Some("\"cid1\""), "cid1"));
+        assert!(if_none_match_matches(Some("W/\"cid1\""), "cid1"));
+        assert!(if_none_match_matches(Some("*"), "anything"));
+        assert!(if_none_match_matches(Some("\"x\", \"cid1\", \"y\""), "cid1"));
+        assert!(!if_none_match_matches(Some("\"other\""), "cid1"));
+        assert!(!if_none_match_matches(None, "cid1"));
+    }
+
+    #[test]
+    fn not_modified_has_validators_and_no_body() {
+        let bytes = vec![0u8; 4];
+        let c = cache_with("cid1", bytes, 3600, 0);
+        let resp = not_modified("cid1", &c, 0);
+        assert_eq!(resp.status, 304);
+        assert_eq!(resp.body, Body::None);
+        assert_eq!(resp.header("ETag"), Some("\"cid1\""));
+        assert!(resp.header("Cache-Control").unwrap().contains("immutable"));
     }
 
     #[test]

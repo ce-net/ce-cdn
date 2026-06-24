@@ -23,6 +23,18 @@ struct CacheEntry {
     expires_at: u64,
     /// Monotonic access tick; the smallest value is the least-recently-used entry.
     last_tick: u64,
+    /// Per-CID read counters (reset when the entry is dropped/re-inserted).
+    hits: u64,
+    misses: u64,
+}
+
+/// A short-lived negative-cache tombstone: a CID the origin did not have (a 404). Repeated reads of
+/// a known-absent CID are answered from this tombstone instead of re-hitting the origin, closing the
+/// origin-amplification DoS where a flood of GETs for a missing CID hammers the backing store.
+#[derive(Debug, Clone)]
+struct Tombstone {
+    /// Unix second after which the negative result is forgotten and the origin may be retried.
+    expires_at: u64,
 }
 
 /// Running counters describing cache effectiveness. Cheap to copy; surfaced by `stats()`.
@@ -40,6 +52,10 @@ pub struct CacheStats {
     pub entries: u64,
     /// Current total bytes held across all entries.
     pub bytes: u64,
+    /// Reads short-circuited by a negative-cache tombstone (a known-absent CID not re-fetched).
+    pub negative_hits: u64,
+    /// Current number of live negative-cache tombstones.
+    pub tombstones: u64,
 }
 
 impl CacheStats {
@@ -50,14 +66,26 @@ impl CacheStats {
     }
 }
 
+/// Default lifetime of a negative-cache tombstone (seconds). Short by design: a 404 is only worth
+/// remembering briefly, because the publisher may put the object at any moment and a content-
+/// addressed CID never changes once present.
+pub const DEFAULT_NEGATIVE_TTL_SECS: u64 = 10;
+
 /// An LRU + TTL edge cache bounded by a total byte budget.
 #[derive(Debug)]
 pub struct EdgeCache {
     entries: HashMap<String, CacheEntry>,
+    /// Short-lived negative-cache tombstones (CID -> tombstone). Bounded by [`max_tombstones`].
+    tombstones: HashMap<String, Tombstone>,
     /// Maximum total bytes the cache may hold. Inserts evict LRU entries to stay within it.
     max_bytes: u64,
     /// Default TTL applied when an insert does not specify one. `0` = no expiry.
     default_ttl_secs: u64,
+    /// Negative-cache TTL applied to tombstones (`0` disables negative caching entirely).
+    negative_ttl_secs: u64,
+    /// Hard cap on the number of negative tombstones (so the negative cache cannot itself grow
+    /// unbounded under a flood of distinct missing CIDs).
+    max_tombstones: usize,
     /// Current total bytes held (maintained incrementally to avoid O(n) sums).
     cur_bytes: u64,
     /// Monotonic counter handing out recency ticks; advances on every read and insert.
@@ -66,6 +94,21 @@ pub struct EdgeCache {
     misses: u64,
     expirations: u64,
     evictions: u64,
+    negative_hits: u64,
+}
+
+/// Default ceiling on live negative tombstones.
+pub const DEFAULT_MAX_TOMBSTONES: usize = 4096;
+
+/// Per-CID read counters, surfaced by [`EdgeCache::object_stats`] for observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStat {
+    /// Bytes currently stored for this CID.
+    pub bytes: u64,
+    /// Reads served from cache for this CID.
+    pub hits: u64,
+    /// Reads that missed (expired/absent) for this CID while it has been tracked.
+    pub misses: u64,
 }
 
 impl EdgeCache {
@@ -74,15 +117,31 @@ impl EdgeCache {
     pub fn new(max_bytes: u64, default_ttl_secs: u64) -> Self {
         EdgeCache {
             entries: HashMap::new(),
+            tombstones: HashMap::new(),
             max_bytes,
             default_ttl_secs,
+            negative_ttl_secs: DEFAULT_NEGATIVE_TTL_SECS,
+            max_tombstones: DEFAULT_MAX_TOMBSTONES,
             cur_bytes: 0,
             tick: 0,
             hits: 0,
             misses: 0,
             expirations: 0,
             evictions: 0,
+            negative_hits: 0,
         }
+    }
+
+    /// Set the negative-cache TTL (seconds); `0` disables negative caching. Returns `self` for
+    /// builder-style configuration.
+    pub fn with_negative_ttl(mut self, secs: u64) -> Self {
+        self.negative_ttl_secs = secs;
+        self
+    }
+
+    /// The negative-cache TTL (seconds) applied to tombstones.
+    pub fn negative_ttl_secs(&self) -> u64 {
+        self.negative_ttl_secs
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -93,6 +152,11 @@ impl EdgeCache {
     /// Default TTL (seconds) applied to inserts that do not override it.
     pub fn default_ttl_secs(&self) -> u64 {
         self.default_ttl_secs
+    }
+
+    /// The cache's total byte budget (the largest single object it can hold).
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
     }
 
     /// Insert (or replace) `cid -> bytes` using the cache's default TTL, evicting LRU entries as
@@ -119,14 +183,69 @@ impl EdgeCache {
                 break; // nothing left to evict (cache empty) — len <= max_bytes so it fits now
             }
         }
+        // A successful insert clears any negative tombstone for this CID (it is present now).
+        self.tombstones.remove(cid);
         let tick = self.next_tick();
         let expires_at = if ttl_secs == 0 { u64::MAX } else { now.saturating_add(ttl_secs) };
         self.cur_bytes += len;
         self.entries.insert(
             cid.to_string(),
-            CacheEntry { bytes, inserted_at: now, expires_at, last_tick: tick },
+            CacheEntry { bytes, inserted_at: now, expires_at, last_tick: tick, hits: 0, misses: 0 },
         );
         true
+    }
+
+    /// Record a negative result: remember that the origin did not hold `cid` at `now`, so repeated
+    /// reads within the negative TTL are answered without re-hitting the origin. A no-op when
+    /// negative caching is disabled (`negative_ttl_secs == 0`). Bounded by `max_tombstones` (evicts
+    /// an arbitrary existing tombstone when full — they are short-lived and interchangeable).
+    pub fn note_absent(&mut self, cid: &str, now: u64) {
+        if self.negative_ttl_secs == 0 {
+            return;
+        }
+        if self.tombstones.len() >= self.max_tombstones && !self.tombstones.contains_key(cid) {
+            // Evict the soonest-to-expire tombstone to make room (keeps the freshest negatives).
+            if let Some(victim) =
+                self.tombstones.iter().min_by_key(|(_, t)| t.expires_at).map(|(k, _)| k.clone())
+            {
+                self.tombstones.remove(&victim);
+            }
+        }
+        self.tombstones
+            .insert(cid.to_string(), Tombstone { expires_at: now.saturating_add(self.negative_ttl_secs) });
+    }
+
+    /// Is `cid` currently tombstoned (known-absent and not yet expired) at `now`? When `true`, the
+    /// caller should answer a miss WITHOUT consulting the origin, and a `negative_hits` counter is
+    /// bumped. An expired tombstone is swept and reported as not-negative (the origin may be retried).
+    pub fn is_negative(&mut self, cid: &str, now: u64) -> bool {
+        match self.tombstones.get(cid) {
+            Some(t) if now <= t.expires_at => {
+                self.negative_hits += 1;
+                true
+            }
+            Some(_) => {
+                self.tombstones.remove(cid);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Per-CID read/size counters for every live entry (for the metrics endpoint). Side-effect free.
+    pub fn object_stats(&self) -> Vec<(String, ObjectStat)> {
+        let mut v: Vec<(String, ObjectStat)> = self
+            .entries
+            .iter()
+            .map(|(cid, e)| {
+                (
+                    cid.clone(),
+                    ObjectStat { bytes: e.bytes.len() as u64, hits: e.hits, misses: e.misses },
+                )
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
     }
 
     /// Look up `cid` at time `now`. Returns the bytes on a fresh hit (and bumps recency + the hit
@@ -137,11 +256,13 @@ impl EdgeCache {
         match self.entries.get_mut(cid) {
             Some(e) if now <= e.expires_at => {
                 e.last_tick = tick;
+                e.hits += 1;
                 self.hits += 1;
                 Some(e.bytes.clone())
             }
-            Some(_) => {
-                // Present but stale: drop it and count a miss + an expiration.
+            Some(e) => {
+                // Present but stale: count a per-CID miss before dropping, then drop it.
+                e.misses += 1;
                 self.drop_entry(cid);
                 self.expirations += 1;
                 self.misses += 1;
@@ -181,6 +302,8 @@ impl EdgeCache {
             self.drop_entry(&k);
             self.expirations += 1;
         }
+        // Also drop expired negative tombstones so they cannot accumulate.
+        self.tombstones.retain(|_, t| now <= t.expires_at);
         n
     }
 
@@ -193,6 +316,8 @@ impl EdgeCache {
             evictions: self.evictions,
             entries: self.entries.len() as u64,
             bytes: self.cur_bytes,
+            negative_hits: self.negative_hits,
+            tombstones: self.tombstones.len() as u64,
         }
     }
 
@@ -226,7 +351,9 @@ impl EdgeCache {
     /// Remove an entry by key, decrementing the byte total. Returns whether it existed.
     fn drop_entry(&mut self, cid: &str) -> bool {
         if let Some(e) = self.entries.remove(cid) {
-            self.cur_bytes -= e.bytes.len() as u64;
+            // Saturating: cur_bytes is maintained incrementally; a (bug-introduced) invariant break
+            // must degrade to a clamped count rather than panic on underflow.
+            self.cur_bytes = self.cur_bytes.saturating_sub(e.bytes.len() as u64);
             true
         } else {
             false
@@ -396,6 +523,62 @@ mod tests {
         c2.insert("b", vec![0; 9], 0); // expires at 5
         assert!(!c2.contains_fresh("b", 100));
         assert_eq!(c2.byte_len("b"), Some(9));
+    }
+
+    #[test]
+    fn negative_cache_remembers_absent_then_expires() {
+        let mut c = EdgeCache::new(100, 0).with_negative_ttl(5);
+        assert!(!c.is_negative("gone", 0)); // nothing remembered yet
+        c.note_absent("gone", 0); // expires at 5
+        assert!(c.is_negative("gone", 3)); // within window -> negative hit
+        assert!(c.is_negative("gone", 5)); // boundary inclusive
+        assert!(!c.is_negative("gone", 6)); // expired -> may retry origin
+        let s = c.stats();
+        assert_eq!(s.negative_hits, 2);
+        // After the expired probe swept it, the tombstone is gone.
+        assert_eq!(c.stats().tombstones, 0);
+    }
+
+    #[test]
+    fn negative_ttl_zero_disables_negative_cache() {
+        let mut c = EdgeCache::new(100, 0).with_negative_ttl(0);
+        c.note_absent("x", 0);
+        assert!(!c.is_negative("x", 0));
+        assert_eq!(c.stats().tombstones, 0);
+    }
+
+    #[test]
+    fn inserting_clears_negative_tombstone() {
+        let mut c = EdgeCache::new(100, 0).with_negative_ttl(30);
+        c.note_absent("late", 0);
+        assert!(c.is_negative("late", 1));
+        // The publisher finally puts it; caching it must clear the tombstone.
+        assert!(c.insert("late", vec![1, 2, 3], 2));
+        assert!(!c.is_negative("late", 3));
+        assert_eq!(c.get("late", 3), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn negative_cache_is_bounded() {
+        let mut c = EdgeCache::new(100, 0).with_negative_ttl(1000);
+        for i in 0..(DEFAULT_MAX_TOMBSTONES + 500) {
+            c.note_absent(&format!("missing-{i}"), 0);
+            assert!(c.stats().tombstones as usize <= DEFAULT_MAX_TOMBSTONES);
+        }
+        assert_eq!(c.stats().tombstones as usize, DEFAULT_MAX_TOMBSTONES);
+    }
+
+    #[test]
+    fn per_object_stats_track_hits_and_misses() {
+        let mut c = EdgeCache::new(100, 0);
+        c.insert("a", vec![0; 5], 0);
+        c.get("a", 0); // hit
+        c.get("a", 0); // hit
+        let os = c.object_stats();
+        assert_eq!(os.len(), 1);
+        assert_eq!(os[0].0, "a");
+        assert_eq!(os[0].1.hits, 2);
+        assert_eq!(os[0].1.bytes, 5);
     }
 
     #[test]
