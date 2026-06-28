@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use ce_cap::{SignedCapability, authorize, decode_chain};
+use ce_iam_core::{SignedCapability, authorize, decode_chain};
 use ce_rs::CeClient;
 use tokio::sync::Mutex;
 
@@ -77,7 +77,7 @@ impl PublicSet {
 ///   point of a public CDN edge.
 /// - Otherwise the caller must present a chain the `authorize` closure accepts for `action`.
 ///
-/// `authorize(action) -> Result<(), String>` wraps `ce_cap::authorize` with the edge's identity,
+/// `authorize(action) -> Result<(), String>` wraps `ce_iam_core::authorize` with the edge's identity,
 /// accepted roots, tags, clock, the requester NodeId, and revocation set already bound in. Keeping
 /// it a closure makes `decide` pure and trivially testable: pass a closure that returns `Ok`/`Err`.
 pub fn decide(

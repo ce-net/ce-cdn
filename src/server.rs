@@ -23,7 +23,7 @@
 //! [`crate::pop`]). The capability is a hex `ce-cap` chain via `X-Ce-Capability` (or
 //! `Authorization: Capability <hex>`) that authorizes `cdn:read` for that requester.
 //!
-//! The same `ce_cap::authorize` the mesh host uses gates the chain, so the HTTP and mesh paths share
+//! The same `ce_iam_core::authorize` the mesh host uses gates the chain, so the HTTP and mesh paths share
 //! one authorization rule. The proof-of-possession is what keeps `X-Ce-Node-Id` from being a
 //! forgeable bearer identity: on the mesh path the requester is the authenticated libp2p sender; on
 //! HTTP nothing else proves the caller holds the requester's key, so a leaked capability chain (it
@@ -40,7 +40,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ce_cap::{SignedCapability, authorize, decode_chain};
+use ce_iam_core::{SignedCapability, authorize, decode_chain};
 use ce_rs::CeClient;
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
@@ -947,7 +947,7 @@ mod tests {
     #[tokio::test]
     async fn http_private_content_with_valid_capability_is_served() {
         use ce_identity::Identity;
-        use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+        use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 
         let dir = std::env::temp_dir().join(format!("ce-cdn-srv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1013,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn http_private_valid_cap_but_no_proof_is_rejected() {
         use ce_identity::Identity;
-        use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+        use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 
         let dir =
             std::env::temp_dir().join(format!("ce-cdn-srv-noproof-{}", std::process::id()));
@@ -1237,7 +1237,7 @@ mod tests {
     #[tokio::test]
     async fn http_pop_proof_is_single_use_replay_rejected() {
         use ce_identity::Identity;
-        use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+        use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
         let dir = std::env::temp_dir().join(format!("ce-cdn-replay-srv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let edge = Identity::load_or_generate(&dir).unwrap();

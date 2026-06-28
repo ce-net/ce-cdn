@@ -6,7 +6,7 @@
 //! range/partial fetch, cache-hit accounting, capability-gated private content, and failure
 //! injection (denied caps, malformed input, missing blob, unsatisfiable range → graceful, no panic).
 
-use ce_cap::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, authorize, decode_chain, encode_chain};
 use ce_cdn::cache::EdgeCache;
 use ce_cdn::cidrange::{ByteRange, RangeOutcome, chunks_for_range, parse_range, slice_span};
 use ce_cdn::edge::{self, Access, Body};
@@ -381,7 +381,7 @@ async fn http_front_end_full_range_416_and_404() {
 
 #[tokio::test]
 async fn http_front_end_private_gate_and_status_sizes() {
-    use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+    use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 
     let edge = ident("http-edge");
     let consumer = ident("http-consumer");
